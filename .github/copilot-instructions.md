@@ -10,7 +10,7 @@
 
 ## What to do first (discovery steps)
 1. Look at `README.md` to capture the stated purpose before adding new features.
-2. Check open **issues** and **milestones** to prioritize work, then review branch protection and recent commits for any unwritten conventions (use `gh issue list`, `gh milestone list`, `git log`, and PR history).
+2. Check open **issues** and **milestones** to prioritize work, then review branch protection and recent commits for any unwritten conventions (use `gh issue list` and `gh milestone list` — e.g. `gh issue list --label "help wanted" --state open` or `gh issue list --assignee @me`). Also review PR history and `git log` for conventions.
 3. If adding code, create a clear project layout (examples below) and update `README.md` with setup/run instructions.
 
 ## Project conventions and minimal expectations
