@@ -1,0 +1,8 @@
+
+# ignore exports + secrets
+app_audit_onefile.csv
+app_audit_onefile.json
+graph_token.txt
+*.csv
+*.json
+venv/
