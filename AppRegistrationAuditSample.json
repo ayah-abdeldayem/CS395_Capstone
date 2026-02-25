@@ -1,0 +1,15 @@
+[
+    {
+      "TimeGenerated": "2025-02-24T16:00:00Z",
+      "AppObjectId": "000a98b9-cb52-4528-9c8c-a3244259ab6f",
+      "AppId": "8082625d-c83f-4a61-964a-b9c747159e6f",
+      "DisplayName": "SchottTest-SP",
+      "PublisherDomain": "l.uky.edu",
+      "SignInAudience": "AzureADMyOrg",
+      "CreatedDateTime": "2021-10-07T15:42:16Z",
+      "SecretExpiryCount": 1,
+      "CertExpiryCount": 0,
+      "HasGraphPermissions": true,
+      "PermissionCount": 3
+    }
+  ]
