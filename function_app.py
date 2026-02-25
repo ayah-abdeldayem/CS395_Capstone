@@ -13,7 +13,6 @@ GRAPH_RESOURCE_APP_ID = "00000003-0000-0000-c000-000000000000"
 
 
 def parse_dt(s: str | None):
-    """Parse Graph ISO timestamps safely (handles trailing Z)."""
     if not s:
         return None
     try:
@@ -30,11 +29,37 @@ def upload_to_dcr(records: list[dict]) -> None:
     credential = DefaultAzureCredential()
     client = LogsIngestionClient(endpoint=endpoint, credential=credential)
 
-    # Upload in chunks to avoid giant payloads / timeouts
     CHUNK_SIZE = 200
     for i in range(0, len(records), CHUNK_SIZE):
-        chunk = records[i:i + CHUNK_SIZE]
-        client.upload(rule_id=rule_id, stream_name=stream_name, logs=chunk)
+        client.upload(rule_id=rule_id, stream_name=stream_name, logs=records[i:i + CHUNK_SIZE])
+
+
+def graph_get_paged(url: str, headers: dict, timeout: int = 30) -> list[dict]:
+    """Follow @odata.nextLink until done."""
+    out: list[dict] = []
+    while url:
+        r = requests.get(url, headers=headers, timeout=timeout)
+        logging.info(f"Graph call status: {r.status_code}")
+        if r.status_code != 200:
+            raise RuntimeError(f"Graph error {r.status_code}: {r.text}")
+        data = r.json()
+        out.extend(data.get("value", []))
+        url = data.get("@odata.nextLink")
+    return out
+
+
+def get_app_owners(app_object_id: str, headers: dict) -> list[dict]:
+    """Owners are separate from the app object."""
+    owners_url = (
+        f"https://graph.microsoft.com/v1.0/applications/{app_object_id}/owners"
+        "?$select=id,displayName,userPrincipalName"
+        "&$top=999"
+    )
+    try:
+        return graph_get_paged(owners_url, headers=headers)
+    except Exception as e:
+        logging.warning(f"Owners lookup failed for {app_object_id}: {e}")
+        return []
 
 
 @app.timer_trigger(schedule="0 0 2 1 * *", arg_name="mytimer", run_on_startup=False)
@@ -44,6 +69,7 @@ def app_registration_audit(mytimer: func.TimerRequest) -> None:
     tenant_id = os.environ.get("TENANT_ID")
     client_id = os.environ.get("CLIENT_ID")
     client_secret = os.environ.get("CLIENT_SECRET")
+    subscription_id = os.environ.get("SUBSCRIPTION_ID", "")
 
     if not all([tenant_id, client_id, client_secret]):
         logging.error("Missing TENANT_ID, CLIENT_ID, or CLIENT_SECRET")
@@ -67,47 +93,29 @@ def app_registration_audit(mytimer: func.TimerRequest) -> None:
             return
         logging.info("Access token acquired successfully")
     except Exception as e:
-        logging.error(f"Token request failed: {str(e)}")
+        logging.error(f"Token request failed: {e}")
         return
 
     headers = {"Authorization": f"Bearer {access_token}"}
 
-    # 2) Pull apps with the fields we need for metrics
-    select_fields = (
-        "id,appId,displayName,createdDateTime,publisherDomain,signInAudience,"
-        "passwordCredentials,keyCredentials,requiredResourceAccess"
-    )
+    # 2) Pull apps (NO $select => most complete set of fields)
+    apps_url = "https://graph.microsoft.com/v1.0/applications?$top=999"
 
-    url = (
-        "https://graph.microsoft.com/v1.0/applications"
-        f"?$top=999&$select={select_fields}"
-    )
-
-    all_apps: list[dict] = []
-    while url:
-        try:
-            response = requests.get(url, headers=headers, timeout=30)
-        except Exception as e:
-            logging.error(f"Graph request failed: {e}")
-            return
-
-        logging.info(f"Graph call status: {response.status_code}")
-
-        if response.status_code != 200:
-            logging.error(f"Graph error: {response.text}")
-            return
-
-        data = response.json()
-        all_apps.extend(data.get("value", []))
-        url = data.get("@odata.nextLink")
+    try:
+        all_apps = graph_get_paged(apps_url, headers=headers)
+    except Exception as e:
+        logging.error(f"Applications pull failed: {e}")
+        return
 
     logging.info(f"Total applications retrieved: {len(all_apps)}")
 
-    # 3) Build records for Log Analytics
+    # 3) Build records
     now_dt = datetime.now(timezone.utc)
     records: list[dict] = []
 
     for a in all_apps:
+        app_object_id = a.get("id")
+
         pw_creds = a.get("passwordCredentials") or []
         key_creds = a.get("keyCredentials") or []
         rra = a.get("requiredResourceAccess") or []
@@ -126,13 +134,31 @@ def app_registration_audit(mytimer: func.TimerRequest) -> None:
             if end and end <= now_dt:
                 cert_expiry_count += 1
 
-        # permissions
-        has_graph_permissions = any(x.get("resourceAppId") == GRAPH_RESOURCE_APP_ID for x in rra)
-        permission_count = sum(len(x.get("resourceAccess") or []) for x in rra)
+        # exact permissions list (IDs + type)
+        permissions: list[dict] = []
+        for r in rra:
+            resource_app_id = r.get("resourceAppId")
+            for access in (r.get("resourceAccess") or []):
+                permissions.append({
+                    "resourceAppId": resource_app_id,
+                    "permissionId": access.get("id"),
+                    "type": access.get("type")  # "Scope" or "Role"
+                })
+
+        permission_count = len(permissions)
+        has_graph_permissions = any(p.get("resourceAppId") == GRAPH_RESOURCE_APP_ID for p in permissions)
+
+        # owners
+        owners = get_app_owners(app_object_id, headers) if app_object_id else []
+        owner_count = len(owners)
 
         records.append({
             "TimeGenerated": now_dt.isoformat(),
-            "AppObjectId": a.get("id"),
+
+            "TenantId": tenant_id,
+            "SubscriptionId": subscription_id,
+
+            "AppObjectId": app_object_id,
             "AppId": a.get("appId"),
             "DisplayName": a.get("displayName"),
             "PublisherDomain": a.get("publisherDomain"),
@@ -141,8 +167,15 @@ def app_registration_audit(mytimer: func.TimerRequest) -> None:
 
             "SecretExpiryCount": secret_expiry_count,
             "CertExpiryCount": cert_expiry_count,
-            "HasGraphPermissions": has_graph_permissions,
+
+            "OwnerCount": owner_count,
+            "Owners": owners,                 # dynamic
+
             "PermissionCount": permission_count,
+            "HasGraphPermissions": has_graph_permissions,
+            "Permissions": permissions,       # dynamic
+
+            "RawApp": a                       # dynamic (all fields you received)
         })
 
     # 4) Upload via DCR
